@@ -326,7 +326,7 @@ class Qwen3TTSTokenizer:
         else:
             # List[Tensor/np]
             audio_codes_list = [_to_tensor(c, dtype=torch.long) for c in audio_codes_list]
-            audio_codes_padded = pad_sequence(audio_codes_list, batch_first=True, padding_value=-1).to(self.device)
+            audio_codes_padded = pad_sequence(audio_codes_list, batch_first=True, padding_value=0).to(self.device)
 
         with torch.inference_mode():
             if model_type == "qwen3_tts_tokenizer_25hz":
@@ -409,3 +409,34 @@ class Qwen3TTSTokenizer:
             int: Decode upsample rate.
         """
         return int(self.model.get_decode_upsample_rate())
+
+    def enable_streaming_optimizations(
+        self,
+        decode_window_frames: int = 80,
+        use_compile: bool = True,
+        use_cuda_graphs: bool = True,
+        compile_mode: str = "reduce-overhead",
+    ):
+        """
+        Enable torch.compile and CUDA graphs optimizations for streaming decode.
+
+        Args:
+            decode_window_frames: Fixed window size for streaming (must match streaming params)
+            use_compile: Apply torch.compile to decoder
+            use_cuda_graphs: Capture CUDA graphs for fixed-size operations
+            compile_mode: torch.compile mode ("reduce-overhead" recommended for streaming)
+
+        Returns:
+            self for method chaining
+        """
+        model_type = self.model.get_model_type()
+        if model_type != "qwen3_tts_tokenizer_12hz":
+            print(f"[Tokenizer] Optimizations only supported for 12Hz tokenizer, got {model_type}")
+            return self
+
+        return self.model.enable_streaming_optimizations(
+            decode_window_frames=decode_window_frames,
+            use_compile=use_compile,
+            use_cuda_graphs=use_cuda_graphs,
+            compile_mode=compile_mode,
+        )

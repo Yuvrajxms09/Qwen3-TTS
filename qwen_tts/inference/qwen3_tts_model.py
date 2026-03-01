@@ -17,7 +17,7 @@ import base64
 import io
 import urllib.request
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, Generator, List, Optional, Tuple, Union
 from urllib.parse import urlparse
 
 import librosa
@@ -119,6 +119,57 @@ class Qwen3TTSModel:
 
         generate_defaults = model.generate_config
         return cls(model=model, processor=processor, generate_defaults=generate_defaults)
+
+    def enable_streaming_optimizations(
+        self,
+        decode_window_frames: int = 80,
+        use_compile: bool = True,
+        use_cuda_graphs: bool = True,
+        compile_mode: str = "reduce-overhead",
+        compile_codebook_predictor: bool = True,
+        compile_talker: bool = True,
+    ):
+        """
+        Enable torch.compile and CUDA graphs optimizations for streaming decode.
+
+        Significantly speeds up streaming generation by:
+        1. Compiling the decoder with torch.compile (reduces Python overhead)
+        2. Capturing CUDA graphs for fixed-size decode windows (eliminates GPU launch overhead)
+        3. Compiling the talker model (reduces Python overhead in main generation)
+
+        Call this method after loading the model, before starting streaming generation.
+
+        Args:
+            decode_window_frames: Fixed window size for streaming (must match the
+                                  decode_window_frames parameter in stream_generate_voice_clone)
+            use_compile: Apply torch.compile to the decoder (default True)
+            use_cuda_graphs: Capture CUDA graphs for the fixed window size (default True)
+            compile_mode: torch.compile mode - "reduce-overhead" (recommended for streaming),
+                          "max-autotune", or "default"
+            compile_codebook_predictor: Apply torch.compile to codebook predictor (default True)
+            compile_talker: Apply torch.compile to talker model (default True).
+                           Note: Talker always uses "default" mode to avoid CUDA graph conflicts.
+
+        Returns:
+            self for method chaining
+
+        Example:
+            model = Qwen3TTSModel.from_pretrained("Qwen/Qwen3-TTS-12Hz-1.7B-Base", ...)
+            model.enable_streaming_optimizations(decode_window_frames=80)
+
+            # Now streaming will be faster
+            for chunk, sr in model.stream_generate_voice_clone(..., decode_window_frames=80):
+                ...
+        """
+        self.model.enable_streaming_optimizations(
+            decode_window_frames=decode_window_frames,
+            use_compile=use_compile,
+            use_cuda_graphs=use_cuda_graphs,
+            compile_mode=compile_mode,
+            compile_codebook_predictor=compile_codebook_predictor,
+            compile_talker=compile_talker,
+        )
+        return self
 
     def _supported_languages_set(self) -> Optional[set]:
         langs = getattr(self.model, "get_supported_languages", None)
@@ -632,6 +683,7 @@ class Qwen3TTSModel:
 
         return wavs_out, fs
 
+
     # voice design model
     @torch.no_grad()
     def generate_voice_design(
@@ -639,7 +691,7 @@ class Qwen3TTSModel:
         text: Union[str, List[str]],
         instruct: Union[str, List[str]],
         language: Union[str, List[str]] = None,
-        non_streaming_mode: bool = True,
+        non_streaming_mode: bool = False,
         **kwargs,
     ) -> Tuple[List[np.ndarray], int]:
         """
@@ -735,7 +787,7 @@ class Qwen3TTSModel:
         speaker: Union[str, List[str]],
         language: Union[str, List[str]] = None,
         instruct: Optional[Union[str, List[str]]] = None,
-        non_streaming_mode: bool = True,
+        non_streaming_mode: bool = False,
         **kwargs,
     ) -> Tuple[List[np.ndarray], int]:
         """
