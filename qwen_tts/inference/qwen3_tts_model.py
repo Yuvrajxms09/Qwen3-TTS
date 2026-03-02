@@ -15,6 +15,7 @@
 # limitations under the License.
 import base64
 import io
+import logging
 import urllib.request
 from dataclasses import dataclass
 from typing import Any, Dict, Generator, List, Optional, Tuple, Union
@@ -27,6 +28,8 @@ import torch
 from transformers import AutoConfig, AutoModel, AutoProcessor
 
 from ..core.models import Qwen3TTSConfig, Qwen3TTSForConditionalGeneration, Qwen3TTSProcessor
+
+logger = logging.getLogger(__name__)
 
 AudioLike = Union[
     str,                     # wav path, URL, base64
@@ -122,49 +125,27 @@ class Qwen3TTSModel:
 
     def enable_streaming_optimizations(
         self,
-        decode_window_frames: int = 80,
         use_compile: bool = True,
-        use_cuda_graphs: bool = True,
         compile_mode: str = "reduce-overhead",
         compile_codebook_predictor: bool = True,
         compile_talker: bool = True,
     ):
         """
-        Enable torch.compile and CUDA graphs optimizations for streaming decode.
+        Enable torch.compile for talker and codebook predictor (non-streaming inference).
 
-        Significantly speeds up streaming generation by:
-        1. Compiling the decoder with torch.compile (reduces Python overhead)
-        2. Capturing CUDA graphs for fixed-size decode windows (eliminates GPU launch overhead)
-        3. Compiling the talker model (reduces Python overhead in main generation)
-
-        Call this method after loading the model, before starting streaming generation.
+        Call after model loading to speed up generate_voice_clone.
 
         Args:
-            decode_window_frames: Fixed window size for streaming (must match the
-                                  decode_window_frames parameter in stream_generate_voice_clone)
-            use_compile: Apply torch.compile to the decoder (default True)
-            use_cuda_graphs: Capture CUDA graphs for the fixed window size (default True)
-            compile_mode: torch.compile mode - "reduce-overhead" (recommended for streaming),
-                          "max-autotune", or "default"
-            compile_codebook_predictor: Apply torch.compile to codebook predictor (default True)
-            compile_talker: Apply torch.compile to talker model (default True).
-                           Note: Talker always uses "default" mode to avoid CUDA graph conflicts.
+            use_compile: Apply torch.compile when True
+            compile_mode: torch.compile mode for codebook predictor ("reduce-overhead" or "max-autotune")
+            compile_codebook_predictor: Compile codebook predictor (default True)
+            compile_talker: Compile talker model (default True)
 
         Returns:
             self for method chaining
-
-        Example:
-            model = Qwen3TTSModel.from_pretrained("Qwen/Qwen3-TTS-12Hz-1.7B-Base", ...)
-            model.enable_streaming_optimizations(decode_window_frames=80)
-
-            # Now streaming will be faster
-            for chunk, sr in model.stream_generate_voice_clone(..., decode_window_frames=80):
-                ...
         """
         self.model.enable_streaming_optimizations(
-            decode_window_frames=decode_window_frames,
             use_compile=use_compile,
-            use_cuda_graphs=use_cuda_graphs,
             compile_mode=compile_mode,
             compile_codebook_predictor=compile_codebook_predictor,
             compile_talker=compile_talker,

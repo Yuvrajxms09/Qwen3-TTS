@@ -1362,109 +1362,6 @@ class Qwen3TTSTalkerCodePredictorModelForConditionalGeneration(Qwen3TTSPreTraine
         model_kwargs["generation_steps"] = outputs.generation_steps
         return model_kwargs
 
-    def generate_fast(
-        self,
-        inputs_embeds: torch.Tensor,
-        num_codebooks: int,
-        do_sample: bool = True,
-        temperature: float = 1.0,
-        top_k: int = 50,
-        top_p: float = 1.0,
-    ) -> torch.Tensor:
-        """
-        Fast generation that bypasses HuggingFace's generate() overhead.
-
-        This is ~2-3x faster than using generate() because:
-        1. No GenerationMixin overhead (config creation, stopping criteria, etc.)
-        2. Direct forward calls with minimal wrapper logic
-        3. Simple KV-cache management
-
-        Args:
-            inputs_embeds: Initial embeddings [B, 2, hidden_size] (past_hidden + first_token_embed)
-            num_codebooks: Number of codebook tokens to generate (typically 7)
-            do_sample: Whether to sample or use greedy decoding
-            temperature: Sampling temperature
-            top_k: Top-k filtering
-            top_p: Top-p (nucleus) filtering
-
-        Returns:
-            Generated token IDs [B, num_codebooks]
-        """
-        batch_size = inputs_embeds.shape[0]
-        device = inputs_embeds.device
-
-        # Project inputs
-        inputs_embeds = self.small_to_mtp_projection(inputs_embeds)
-
-        # Prefill: process initial embeddings
-        outputs = self.model(
-            input_ids=None,
-            inputs_embeds=inputs_embeds,
-            use_cache=True,
-            output_hidden_states=False,
-        )
-        past_key_values = outputs.past_key_values
-        hidden_states = outputs.last_hidden_state
-
-        # Generate tokens for each codebook
-        generated_tokens = []
-        generation_step = 0  # Start from codebook 1 (index 0 in lm_head)
-
-        for step in range(num_codebooks):
-            # Get logits for current codebook
-            logits = self.lm_head[step](hidden_states[:, -1, :])  # [B, vocab_size]
-
-            # Sample or greedy
-            if do_sample and temperature > 0:
-                logits = logits / temperature
-
-                # Top-k filtering
-                if top_k > 0:
-                    top_k_val = min(top_k, logits.size(-1))
-                    indices_to_remove = logits < torch.topk(logits, top_k_val)[0][..., -1, None]
-                    logits = logits.masked_fill(indices_to_remove, float('-inf'))
-
-                # Top-p filtering
-                if top_p < 1.0:
-                    sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-                    cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-                    sorted_indices_to_remove = cumulative_probs > top_p
-                    sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-                    sorted_indices_to_remove[..., 0] = 0
-                    indices_to_remove = sorted_indices_to_remove.scatter(
-                        1, sorted_indices, sorted_indices_to_remove
-                    )
-                    logits = logits.masked_fill(indices_to_remove, float('-inf'))
-
-                probs = F.softmax(logits, dim=-1)
-                next_token = torch.multinomial(probs, num_samples=1)
-            else:
-                next_token = torch.argmax(logits, dim=-1, keepdim=True)
-
-            generated_tokens.append(next_token)
-
-            # Stop if we've generated all codebooks
-            if step == num_codebooks - 1:
-                break
-
-            # Get embedding for next step
-            next_embeds = self.model.get_input_embeddings()[step](next_token)
-            next_embeds = self.small_to_mtp_projection(next_embeds)
-
-            # Forward pass for next position
-            outputs = self.model(
-                input_ids=None,
-                inputs_embeds=next_embeds,
-                past_key_values=past_key_values,
-                use_cache=True,
-                output_hidden_states=False,
-            )
-            past_key_values = outputs.past_key_values
-            hidden_states = outputs.last_hidden_state
-
-        # Concatenate all generated tokens
-        return torch.cat(generated_tokens, dim=-1)  # [B, num_codebooks]
-
     def enable_compile(self, mode: str = "reduce-overhead"):
         """
         Enable torch.compile for the code predictor model.
@@ -1792,10 +1689,6 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
         sub_talker_loss = sub_talker_outputs.loss
         return sub_talker_logits, sub_talker_loss
 
-    def enable_fast_codebook_gen(self, enable: bool = True):
-        """Enable fast codebook generation (bypasses HuggingFace generate() overhead)."""
-        self._use_fast_codebook_gen = enable
-
     def enable_compile(self, mode: str = "default"):
         """
         Enable torch.compile for the talker model.
@@ -1854,49 +1747,23 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
         # Generate
         else:
             last_id_hidden = self.get_input_embeddings()(input_ids)
-
-            # Use fast path if enabled (bypasses HuggingFace generate() overhead)
-            use_fast = getattr(self, '_use_fast_codebook_gen', False)
-
-            if use_fast:
-                # Fast path: direct forward loop (~2-3x faster)
-                # Mark step begin for CUDA graphs to avoid tensor overwrite errors
-                torch.compiler.cudagraph_mark_step_begin()
-                codebook_tokens = self.code_predictor.generate_fast(
-                    inputs_embeds=torch.cat((past_hidden, last_id_hidden), dim=1),
-                    num_codebooks=self.config.num_code_groups - 1,
-                    do_sample=subtalker_dosample if subtalker_dosample is not None else True,
-                    temperature=subtalker_temperature if subtalker_temperature is not None else 1.0,
-                    top_k=subtalker_top_k if subtalker_top_k is not None else 50,
-                    top_p=subtalker_top_p if subtalker_top_p is not None else 1.0,
-                )
-                codec_ids = torch.cat((input_ids, codebook_tokens), dim=-1)
-                codec_hiddens = torch.cat(
-                    [last_id_hidden]
-                    + [self.code_predictor.get_input_embeddings()[i](codebook_tokens[..., i:i+1]) for i in range(self.config.num_code_groups - 1)],
-                    dim=1,
-                )
-            else:
-                # Original path: HuggingFace generate()
-                # Mark step begin for CUDA graphs to avoid tensor overwrite errors
-                torch.compiler.cudagraph_mark_step_begin()
-                predictor_result = self.code_predictor.generate(
-                    inputs_embeds=torch.cat((past_hidden, last_id_hidden), dim=1),
-                    max_new_tokens=self.config.num_code_groups - 1,
-                    do_sample=subtalker_dosample,
-                    top_p=subtalker_top_p,
-                    top_k=subtalker_top_k,
-                    temperature=subtalker_temperature,
-                    output_hidden_states=True,
-                    return_dict_in_generate=True,
-                )
-                codec_ids = torch.cat((input_ids, predictor_result.sequences), dim=-1)
-                codec_hiddens = torch.cat(
-                    [last_id_hidden]
-                    + [self.code_predictor.get_input_embeddings()[i](predictor_result.sequences[..., i:i+1]) for i in range(self.config.num_code_groups - 1)],
-                    dim=1,
-                )
-
+            torch.compiler.cudagraph_mark_step_begin()
+            predictor_result = self.code_predictor.generate(
+                inputs_embeds=torch.cat((past_hidden, last_id_hidden), dim=1),
+                max_new_tokens=self.config.num_code_groups - 1,
+                do_sample=subtalker_dosample,
+                top_p=subtalker_top_p,
+                top_k=subtalker_top_k,
+                temperature=subtalker_temperature,
+                output_hidden_states=True,
+                return_dict_in_generate=True,
+            )
+            codec_ids = torch.cat((input_ids, predictor_result.sequences), dim=-1)
+            codec_hiddens = torch.cat(
+                [last_id_hidden]
+                + [self.code_predictor.get_input_embeddings()[i](predictor_result.sequences[..., i:i+1]) for i in range(self.config.num_code_groups - 1)],
+                dim=1,
+            )
             inputs_embeds = codec_hiddens.sum(1, keepdim=True)
 
             if generation_step < trailing_text_hidden.shape[1]:
@@ -2067,64 +1934,33 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
 
     def enable_streaming_optimizations(
         self,
-        decode_window_frames: int = 80,
         use_compile: bool = True,
-        use_cuda_graphs: bool = True,
         compile_mode: str = "reduce-overhead",
-        use_fast_codebook: bool = False,  # Disabled: needs debugging, currently slower
         compile_codebook_predictor: bool = True,
         compile_talker: bool = True,
     ):
         """
-        Enable torch.compile and CUDA graphs optimizations for streaming decode.
+        Enable torch.compile for talker and codebook predictor (non-streaming inference).
 
-        Call this after model loading to speed up streaming generation.
-        The optimizations apply to the speech tokenizer's decoder and talker.
+        Call after model loading. Does not apply decoder compile (decoder path uses
+        chunked_decode + forward; use this for generate_voice_clone / non-streaming).
 
         Args:
-            decode_window_frames: Fixed window size for streaming (must match
-                                  decode_window_frames parameter in stream_generate_pcm)
-            use_compile: Apply torch.compile to the decoder
-            use_cuda_graphs: Capture CUDA graphs for the fixed window size
-            compile_mode: torch.compile mode ("reduce-overhead" recommended for decoder/codebook)
-            use_fast_codebook: Use fast codebook generation (bypasses HF generate() overhead)
-            compile_codebook_predictor: Apply torch.compile to codebook predictor (default True)
-            compile_talker: Apply torch.compile to talker model (default True).
-                           Note: Talker always uses "default" mode to avoid CUDA graph conflicts.
+            use_compile: Apply torch.compile when True
+            compile_mode: torch.compile mode for codebook predictor ("reduce-overhead" or "max-autotune")
+            compile_codebook_predictor: Compile codebook predictor (default True)
+            compile_talker: Compile talker model (default True). Uses "default" mode to avoid KV-cache conflicts.
 
         Returns:
             self for method chaining
-
-        Example:
-            model = Qwen3TTSForConditionalGeneration.from_pretrained(...)
-            model.enable_streaming_optimizations(decode_window_frames=80)
         """
-        if self.speech_tokenizer is None:
-            raise ValueError("Speech tokenizer not loaded. Call from_pretrained() first.")
-
-        # Enable decoder optimizations
-        self.speech_tokenizer.enable_streaming_optimizations(
-            decode_window_frames=decode_window_frames,
-            use_compile=use_compile,
-            use_cuda_graphs=use_cuda_graphs,
-            compile_mode=compile_mode,
-        )
-
-        # Enable fast codebook generation (bypasses HuggingFace generate() overhead)
-        if use_fast_codebook:
-            print("[Talker] Enabling fast codebook generation...")
-            self.talker.enable_fast_codebook_gen(True)
-
-        # Compile talker model for faster inference
-        # Note: Talker uses "default" mode to avoid CUDA graph conflicts with KV-cache
         if compile_talker and use_compile:
-            talker_compile_mode = "default"  # reduce-overhead causes CUDA graph conflicts
-            print(f"[Talker] Compiling model with mode={talker_compile_mode}...")
+            talker_compile_mode = "default"
+            logger.info("Compiling talker with mode=%s", talker_compile_mode)
             self.talker.enable_compile(mode=talker_compile_mode)
 
-        # Compile codebook predictor for faster inference
         if compile_codebook_predictor and use_compile:
-            print(f"[CodePredictor] Compiling model with mode={compile_mode}...")
+            logger.info("Compiling codebook predictor with mode=%s", compile_mode)
             self.talker.code_predictor.enable_compile(mode=compile_mode)
 
         return self
