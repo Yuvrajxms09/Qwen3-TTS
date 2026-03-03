@@ -15,6 +15,7 @@
 # limitations under the License.
 import base64
 import io
+import time
 import urllib.request
 from dataclasses import dataclass
 from typing import Any, Dict, Generator, List, Optional, Tuple, Union
@@ -651,6 +652,9 @@ class Qwen3TTSModel:
 
         gen_kwargs = self._merge_generate_kwargs(**kwargs)
 
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        t_talker = time.perf_counter()
         talker_codes_list, _ = self.model.generate(
             input_ids=input_ids,
             ref_ids=ref_ids,
@@ -659,6 +663,9 @@ class Qwen3TTSModel:
             non_streaming_mode=non_streaming_mode,
             **gen_kwargs,
         )
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        talker_s = time.perf_counter() - t_talker
 
         codes_for_decode = []
         for i, codes in enumerate(talker_codes_list):
@@ -668,7 +675,15 @@ class Qwen3TTSModel:
             else:
                 codes_for_decode.append(codes)
 
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        t_decode = time.perf_counter()
         wavs_all, fs = self.model.speech_tokenizer.decode([{"audio_codes": c} for c in codes_for_decode])
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        decode_s = time.perf_counter() - t_decode
+        inference_total_s = talker_s + decode_s
+        print(f"[Qwen3TTS inference] talker={talker_s:.3f}s decode={decode_s:.3f}s total={inference_total_s:.3f}s")
 
         wavs_out: List[np.ndarray] = []
         for i, wav in enumerate(wavs_all):
